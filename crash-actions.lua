@@ -25,6 +25,18 @@ local SERVO_PARAM          = {
     [ACTION.SET_SERVO_MAX]  = "MAX",
 }
 local MAX_INSTANCES        = 32 -- max number of relay/servo instances
+local MAV_RESULT_ACCEPTED  = 0
+local RELAY_FUNCTION_RELAY = 1
+
+-- servo functions that MAV_CMD_DO_SET_SERVO will drive (see AP_ServoRelayEvents)
+local function servo_function_settable(fn)
+    return fn == 0 or                -- disabled (general use PWM)
+        fn == 1 or                   -- RCPassThru
+        fn == 22 or fn == 23 or      -- sprayer pump/spinner
+        fn == 28 or                  -- gripper
+        (fn >= 51 and fn <= 66) or   -- RCIN1-16
+        (fn >= 140 and fn <= 155)    -- RCIN1Scaled-16
+end
 
 -- parameter table variables
 local NUM_CRASH_ACTIONS    = 4
@@ -45,15 +57,16 @@ local valid_servos         = {}
 
 local crash_time_ms        = uint32_t(0)
 
--- determine valid (configured) servo/relay instances
+-- determine valid servo/relay instances
+-- relay:on/off() only drive relays with RELAYn_FUNCTION = 1 (Relay)
+-- DO_SET_SERVO rejects channels assigned to most output functions
 for i = 1, MAX_INSTANCES do
-    local val = param:get(string.format("RELAY%d_FUNCTION", i)) or 0
-    if val > 0 then
+    if param:get(string.format("RELAY%d_FUNCTION", i)) == RELAY_FUNCTION_RELAY then
         valid_relays[i] = true
     end
 
-    val = param:get(string.format("SERVO%d_FUNCTION", i)) or 0
-    if val > 0 then
+    local fn = param:get(string.format("SERVO%d_FUNCTION", i))
+    if fn and servo_function_settable(fn) then
         valid_servos[i] = true
     end
 end
@@ -98,7 +111,7 @@ local function handle_crash_action(action_type, instance)
 
     if action_type == ACTION.SET_RELAY_OFF or action_type == ACTION.SET_RELAY_ON then
         if not valid_relays[instance] then
-            gcs:send_text(MAV_SEVERITY.ERROR, string.format("%s: RELAY%d not configured", SCRIPT_NAME, instance))
+            gcs:send_text(MAV_SEVERITY.ERROR, string.format("%s: RELAY%d_FUNCTION is not Relay (1)", SCRIPT_NAME, instance))
             return
         end
         local state = (action_type == ACTION.SET_RELAY_OFF) and "OFF" or "ON"
@@ -113,7 +126,7 @@ local function handle_crash_action(action_type, instance)
 
     if action_type == ACTION.SET_SERVO_MIN or action_type == ACTION.SET_SERVO_TRIM or action_type == ACTION.SET_SERVO_MAX then
         if not valid_servos[instance] then
-            gcs:send_text(MAV_SEVERITY.ERROR, string.format("%s: SERVO%d not configured", SCRIPT_NAME, instance))
+            gcs:send_text(MAV_SEVERITY.ERROR, string.format("%s: SERVO%d_FUNCTION not settable by DO_SET_SERVO", SCRIPT_NAME, instance))
             return
         end
 
@@ -124,10 +137,15 @@ local function handle_crash_action(action_type, instance)
                 string.format("%s: Failed to get SERVO%d_%s", SCRIPT_NAME, instance, suffix))
             return
         end
-        gcs:send_text(MAV_SEVERITY.NOTICE, string.format("%s: Setting SERVO%d %s", SCRIPT_NAME, instance, suffix))
         -- uses MAV_CMD_DO_SET_SERVO rather than SRV_Channels:set_() bindings
         -- gets ignore_small_rcin_changes() behavior used by AP_ServoRelayEvents
-        gcs:run_command_int(MAV_CMD_DO_SET_SERVO, { p1 = instance, p2 = val })
+        local result = gcs:run_command_int(MAV_CMD_DO_SET_SERVO, { p1 = instance, p2 = val })
+        if result ~= MAV_RESULT_ACCEPTED then
+            gcs:send_text(MAV_SEVERITY.ERROR,
+                string.format("%s: Failed to set SERVO%d %s (result %s)", SCRIPT_NAME, instance, suffix, tostring(result)))
+            return
+        end
+        gcs:send_text(MAV_SEVERITY.NOTICE, string.format("%s: Set SERVO%d %s", SCRIPT_NAME, instance, suffix))
         return
     end
 
@@ -178,7 +196,7 @@ protected_wrapper = function()
     local success = false
     success, result = pcall(result)
     if not success then
-        gcs:send_text(MAV_SEVERITY.ERROR, "Internal Error: " .. result)
+        gcs:send_text(MAV_SEVERITY.ERROR, string.format("%s: Internal Error: %s", SCRIPT_NAME, tostring(result)))
         result = standby -- reset the state machine
         return protected_wrapper, 1000
     end
